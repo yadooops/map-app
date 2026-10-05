@@ -5,6 +5,17 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import MaplibreGeocoder from "@maplibre/maplibre-gl-geocoder";
 import "@maplibre/maplibre-gl-geocoder/dist/maplibre-gl-geocoder.css";
 
+// ---------------------------------------------------------------------------
+// COORDINATE CONVENTIONS (keep this in mind when editing)
+// ---------------------------------------------------------------------------
+// - MapLibre API:       always [lng, lat]
+// - GeoJSON:            always [lng, lat]   (longitude first!)
+// - Nominatim API:      returns { lat, lon } as STRINGS — convert with parseFloat
+// - OSRM route URL:     /route/v1/.../{lng1},{lat1};{lng2},{lat2}
+// - Overpass bbox:      "south,west,north,east"  (south first, then west)
+// - Internal objects:   { lng: number, lat: number } — always lng first
+// ---------------------------------------------------------------------------
+
 const MAPTILER_KEY = "TYASrHzRBDUEA63XTMiR";
 
 const STYLES: Record<string, { url: string; label: string }> = {
@@ -20,12 +31,11 @@ const ESRI_TILES =
 const MAPTILER_S2_TILES =
   `https://api.maptiler.com/tiles/satellite-v2/{z}/{x}/{y}.jpg?key=${MAPTILER_KEY}`;
 
-// Multiple Overpass mirrors — we try each in order
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
-  "https://overpass.openstreetmap.ru/api/interpreter",
   "https://overpass.private.coffee/api/interpreter",
+  "https://overpass.osm.jp/api/interpreter",
 ];
 
 const POI_CATEGORIES = [
@@ -41,19 +51,24 @@ const POI_CATEGORIES = [
 
 type BasemapMode = "vector" | "satellite-esri" | "satellite-s2";
 type MeasureMode = "distance" | "area";
+
+// Our internal coordinate object: always { lng, lat }
+type LngLat = { lng: number; lat: number };
+
+// Our internal coordinate tuple: always [lng, lat]  (matches GeoJSON)
+type Coord = [number, number];
+
 type RouteStep = {
   distance: number;
   duration: number;
   name: string;
-  maneuver: { type: string; modifier?: string; location: [number, number] };
+  maneuver: { type: string; modifier?: string; location: Coord };
 };
-
-type LngLat = { lng: number; lat: number };
 
 type Favorite = {
   id: string;
   name: string;
-  center: [number, number];
+  center: Coord;       // [lng, lat]
   zoom: number;
   bearing: number;
   pitch: number;
@@ -63,6 +78,23 @@ type Favorite = {
 };
 
 const FAV_KEY = "mymaps:favorites";
+
+// -------------------- Helpers --------------------
+
+/** Build a { lng, lat } object from a GeoJSON [lng, lat] tuple */
+function coordToLngLat(c: Coord): LngLat {
+  return { lng: c[0], lat: c[1] };
+}
+
+/** Build a GeoJSON [lng, lat] tuple from a { lng, lat } object */
+function lngLatToCoord(p: LngLat): Coord {
+  return [p.lng, p.lat];
+}
+
+/** Nominatim returns lat/lon as strings — always parse */
+function nominatimToLngLat(lat: string, lon: string): LngLat {
+  return { lng: parseFloat(lon), lat: parseFloat(lat) };
+}
 
 function loadFavorites(): Favorite[] {
   try {
@@ -79,7 +111,8 @@ function saveFavorites(list: Favorite[]) {
   } catch {}
 }
 
-function haversine(a: [number, number], b: [number, number]): number {
+/** Haversine distance in meters — inputs are [lng, lat] tuples */
+function haversine(a: Coord, b: Coord): number {
   const R = 6371000;
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(b[1] - a[1]);
@@ -92,7 +125,8 @@ function haversine(a: [number, number], b: [number, number]): number {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-function polygonArea(coords: [number, number][]): number {
+/** Spherical excess area — inputs are [lng, lat] tuples */
+function polygonArea(coords: Coord[]): number {
   if (coords.length < 3) return 0;
   const R = 6371000;
   const toRad = (d: number) => (d * Math.PI) / 180;
@@ -137,22 +171,27 @@ function stepIcon(step: RouteStep) {
   return "→";
 }
 
-// Try each Overpass mirror in order until one succeeds
+/** Try each Overpass mirror — URLSearchParams avoids Apache 406 */
 async function fetchOverpass(query: string): Promise<any> {
   let lastError: any = null;
   for (const url of OVERPASS_ENDPOINTS) {
     try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const body = new URLSearchParams();
+      body.append("data", query);
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: "data=" + encodeURIComponent(query),
+        body,
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
       });
+      clearTimeout(timer);
       if (!res.ok) {
         lastError = new Error(`${url} → HTTP ${res.status}`);
         continue;
       }
-      const data = await res.json();
-      return data;
+      return await res.json();
     } catch (e) {
       lastError = e;
       continue;
@@ -161,13 +200,16 @@ async function fetchOverpass(query: string): Promise<any> {
   throw lastError ?? new Error("All Overpass mirrors failed");
 }
 
+// -------------------- Component --------------------
+
 export default function Home() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
   const basemapRef = useRef<BasemapMode>("vector");
   const userMarkerRef = useRef<any>(null);
   const userWatchRef = useRef<number | null>(null);
-  const measurePointsRef = useRef<[number, number][]>([]);
+  // Measure points: internal [lng, lat] tuples (matches GeoJSON)
+  const measurePointsRef = useRef<Coord[]>([]);
   const measureMarkersRef = useRef<any[]>([]);
   const measureHandlerRef = useRef<((e: any) => void) | null>(null);
   const routeFromMarkerRef = useRef<any>(null);
@@ -191,9 +233,10 @@ export default function Home() {
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [saveName, setSaveName] = useState("");
 
-  const [directionsOpen, setDirectionsOpen] = useState(false);
+  // Route endpoints stored as { lng, lat }
   const [routeFrom, setRouteFrom] = useState<LngLat | null>(null);
   const [routeTo, setRouteTo] = useState<LngLat | null>(null);
+  const [directionsOpen, setDirectionsOpen] = useState(false);
   const [routeInfo, setRouteInfo] = useState<{
     distance: number;
     duration: number;
@@ -204,8 +247,12 @@ export default function Home() {
 
   const [fromQuery, setFromQuery] = useState("");
   const [toQuery, setToQuery] = useState("");
-  const [fromResults, setFromResults] = useState<any[]>([]);
-  const [toResults, setToResults] = useState<any[]>([]);
+  const [fromResults, setFromResults] = useState<
+    { display_name: string; lat: number; lon: number }[]
+  >([]);
+  const [toResults, setToResults] = useState<
+    { display_name: string; lat: number; lon: number }[]
+  >([]);
   const [activeInput, setActiveInput] = useState<"from" | "to" | null>(null);
 
   useEffect(() => {
@@ -216,6 +263,7 @@ export default function Home() {
     setFavorites(loadFavorites());
   }, []);
 
+  // ---------- Init map ----------
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
@@ -228,6 +276,7 @@ export default function Home() {
     const map = new maplibregl.Map({
       container: containerRef.current,
       style: STYLES[initialStyle].url,
+      // MapLibre always takes [lng, lat]
       center: [44.36, 33.31],
       zoom: 5,
     });
@@ -435,6 +484,7 @@ export default function Home() {
             );
             const data = await res.json();
             for (const f of data.features) {
+              // Nominatim GeoJSON already returns [lng, lat] coordinates
               features.push({
                 type: "Feature",
                 geometry: f.geometry,
@@ -461,17 +511,14 @@ export default function Home() {
         "top-left"
       );
 
+      // Cluster click → zoom. Coordinates from GeoJSON are [lng, lat].
       map.on("click", "poi-clusters", (e: any) => {
         const features = map.queryRenderedFeatures(e.point, {
           layers: ["poi-clusters"],
         });
-        const feature = features[0];
-        if (!feature || !feature.geometry || feature.geometry.type !== "Point") {
-          return;
-        }
-
-        const clusterId = feature.properties.cluster_id;
-        const coords = feature.geometry.coordinates as [number, number];
+        const clusterFeature = features[0] as any;
+        const clusterId = clusterFeature.properties.cluster_id;
+        const coords = clusterFeature.geometry.coordinates as Coord;
         (map.getSource("pois") as any)
           .getClusterExpansionZoom(clusterId)
           .then((zoom: number) => {
@@ -480,9 +527,10 @@ export default function Home() {
           .catch((err: any) => console.error(err));
       });
 
+      // POI click → popup. GeoJSON coordinates are [lng, lat].
       map.on("click", "poi-points", (e: any) => {
         const f = e.features[0];
-        const coords = f.geometry.coordinates.slice();
+        const coords = (f.geometry as any).coordinates.slice() as Coord;
         const props = f.properties;
         new maplibregl.Popup({ offset: 15 })
           .setLngLat(coords)
@@ -519,6 +567,7 @@ export default function Home() {
     };
   }, []);
 
+  // ---------- Basemap switch ----------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -538,6 +587,7 @@ export default function Home() {
     }
   }, [basemap]);
 
+  // ---------- Style switch ----------
   useEffect(() => {
     const map = mapRef.current;
     if (!map || currentStyleRef.current === styleName) return;
@@ -564,11 +614,13 @@ export default function Home() {
     return el;
   };
 
+  // ---------- Pick from/to on map ----------
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !pickMode) return;
     const handler = (e: any) => {
-      const pt = { lng: e.lngLat.lng, lat: e.lngLat.lat };
+      // e.lngLat gives { lng, lat } — keep as our internal format
+      const pt: LngLat = { lng: e.lngLat.lng, lat: e.lngLat.lat };
       if (pickMode === "from") {
         setRouteFrom(pt);
         setFromQuery(`${pt.lat.toFixed(4)}, ${pt.lng.toFixed(4)}`);
@@ -582,23 +634,25 @@ export default function Home() {
     return () => map.off("click", handler);
   }, [pickMode]);
 
+  // ---------- Sync route markers (always [lng, lat] for MapLibre) ----------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
     if (routeFrom) {
+      const ll = lngLatToCoord(routeFrom);
       if (routeFromMarkerRef.current) {
-        routeFromMarkerRef.current.setLngLat([routeFrom.lng, routeFrom.lat]);
+        routeFromMarkerRef.current.setLngLat(ll);
       } else {
         const m = new maplibregl.Marker({
           element: makeRouteDot("#22c55e"),
           draggable: true,
         })
-          .setLngLat([routeFrom.lng, routeFrom.lat])
+          .setLngLat(ll)
           .addTo(map);
         m.on("dragend", () => {
-          const ll = m.getLngLat();
-          setRouteFrom({ lng: ll.lng, lat: ll.lat });
+          const pos = m.getLngLat();
+          setRouteFrom({ lng: pos.lng, lat: pos.lat });
         });
         routeFromMarkerRef.current = m;
       }
@@ -608,18 +662,19 @@ export default function Home() {
     }
 
     if (routeTo) {
+      const ll = lngLatToCoord(routeTo);
       if (routeToMarkerRef.current) {
-        routeToMarkerRef.current.setLngLat([routeTo.lng, routeTo.lat]);
+        routeToMarkerRef.current.setLngLat(ll);
       } else {
         const m = new maplibregl.Marker({
           element: makeRouteDot("#ef4444"),
           draggable: true,
         })
-          .setLngLat([routeTo.lng, routeTo.lat])
+          .setLngLat(ll)
           .addTo(map);
         m.on("dragend", () => {
-          const ll = m.getLngLat();
-          setRouteTo({ lng: ll.lng, lat: ll.lat });
+          const pos = m.getLngLat();
+          setRouteTo({ lng: pos.lng, lat: pos.lat });
         });
         routeToMarkerRef.current = m;
       }
@@ -629,6 +684,8 @@ export default function Home() {
     }
   }, [routeFrom, routeTo]);
 
+  // ---------- Fetch route from OSRM ----------
+  // OSRM URL: /route/v1/driving/{lng1},{lat1};{lng2},{lat2}
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -641,7 +698,10 @@ export default function Home() {
       return;
     }
 
-    const url = `https://router.project-osrm.org/route/v1/driving/${routeFrom.lng},${routeFrom.lat};${routeTo.lng},${routeTo.lat}?overview=full&geometries=geojson&steps=true`;
+    const url =
+      `https://router.project-osrm.org/route/v1/driving/` +
+      `${routeFrom.lng},${routeFrom.lat};${routeTo.lng},${routeTo.lat}` +
+      `?overview=full&geometries=geojson&steps=true`;
 
     setRouteLoading(true);
     fetch(url)
@@ -655,15 +715,16 @@ export default function Home() {
         }
         const steps: RouteStep[] = route.legs?.[0]?.steps ?? [];
         setRouteInfo({ distance: route.distance, duration: route.duration, steps });
+        // GeoJSON geometry: coordinates are [lng, lat] — pass through unchanged
         (map.getSource("route") as any)?.setData({
           type: "FeatureCollection",
           features: [
             { type: "Feature", properties: {}, geometry: route.geometry },
           ],
         });
-        const coords = route.geometry.coordinates as [number, number][];
+        const coords = route.geometry.coordinates as Coord[];
         const bounds = coords.reduce(
-          (b: any, c: [number, number]) => b.extend(c),
+          (b: any, c: Coord) => b.extend(c),
           new maplibregl.LngLatBounds(coords[0], coords[0])
         );
         map.fitBounds(bounds, {
@@ -685,6 +746,7 @@ export default function Home() {
     setToQuery("");
   }
 
+  // ---------- Address search for From/To (Nominatim JSON) ----------
   async function searchAddress(query: string, which: "from" | "to") {
     if (!query.trim()) {
       if (which === "from") setFromResults([]);
@@ -700,6 +762,7 @@ export default function Home() {
       const data = await res.json();
       const mapped = data.map((d: any) => ({
         display_name: d.display_name,
+        // Nominatim JSON returns lat/lon as strings — convert to numbers
         lat: parseFloat(d.lat),
         lon: parseFloat(d.lon),
       }));
@@ -714,7 +777,8 @@ export default function Home() {
     r: { lat: number; lon: number; display_name: string },
     which: "from" | "to"
   ) {
-    const pt = { lng: r.lon, lat: r.lat };
+    // Internal format is { lng, lat }
+    const pt: LngLat = { lng: r.lon, lat: r.lat };
     if (which === "from") {
       setRouteFrom(pt);
       setFromQuery(r.display_name);
@@ -727,6 +791,7 @@ export default function Home() {
     setActiveInput(null);
   }
 
+  // ---------- Favorites ----------
   function openSaveDialog() {
     const map = mapRef.current;
     if (!map) return;
@@ -742,6 +807,7 @@ export default function Home() {
     const fav: Favorite = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       name: saveName.trim() || "Untitled",
+      // MapLibre getCenter() is { lng, lat }; store as [lng, lat] tuple
       center: [c.lng, c.lat],
       zoom: map.getZoom(),
       bearing: map.getBearing(),
@@ -769,6 +835,7 @@ export default function Home() {
     if (fav.basemap !== basemap) setBasemap(fav.basemap);
     if (fav.style !== styleName && fav.basemap === "vector") setStyleName(fav.style);
     map.flyTo({
+      // Favorite.center is [lng, lat] — exactly what MapLibre wants
       center: fav.center,
       zoom: fav.zoom,
       bearing: fav.bearing,
@@ -777,6 +844,7 @@ export default function Home() {
     });
   }
 
+  // ---------- GPS ----------
   function makeUserDot() {
     const wrap = document.createElement("div");
     wrap.style.cssText = `position: relative; width: 20px; height: 20px;`;
@@ -819,15 +887,17 @@ export default function Home() {
     showToast("Getting your location…", 1500);
     userWatchRef.current = navigator.geolocation.watchPosition(
       (pos) => {
+        // Geolocation gives { latitude, longitude } — convert to [lng, lat] for MapLibre
         const { longitude, latitude } = pos.coords;
+        const ll: Coord = [longitude, latitude];
         if (!userMarkerRef.current) {
           const el = makeUserDot();
           userMarkerRef.current = new maplibregl.Marker({ element: el })
-            .setLngLat([longitude, latitude])
+            .setLngLat(ll)
             .addTo(map);
-          map.flyTo({ center: [longitude, latitude], zoom: 15, duration: 1500 });
+          map.flyTo({ center: ll, zoom: 15, duration: 1500 });
         } else {
-          userMarkerRef.current.setLngLat([longitude, latitude]);
+          userMarkerRef.current.setLngLat(ll);
         }
       },
       (err) => {
@@ -845,10 +915,12 @@ export default function Home() {
     );
   }
 
+  // ---------- Measure ----------
   function updateMeasureLayers() {
     const map = mapRef.current;
     if (!map) return;
-    const pts = measurePointsRef.current;
+    const pts = measurePointsRef.current; // already [lng, lat] tuples
+
     const lineData = {
       type: "FeatureCollection" as const,
       features:
@@ -925,7 +997,8 @@ export default function Home() {
       2500
     );
     const handler = (e: any) => {
-      const pt: [number, number] = [e.lngLat.lng, e.lngLat.lat];
+      // Store as [lng, lat] to match GeoJSON
+      const pt: Coord = [e.lngLat.lng, e.lngLat.lat];
       measurePointsRef.current.push(pt);
       const el = document.createElement("div");
       el.style.cssText = `
@@ -943,6 +1016,7 @@ export default function Home() {
     measureHandlerRef.current = handler;
   }
 
+  // ---------- POI search ----------
   async function loadPOIs(categoryId: string) {
     const map = mapRef.current;
     if (!map) return;
@@ -969,7 +1043,12 @@ export default function Home() {
 
     const cat = POI_CATEGORIES.find((c) => c.id === categoryId)!;
     const bounds = map.getBounds();
-    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+    // Overpass bbox order is: south,west,north,east
+    const south = bounds.getSouth();
+    const west = bounds.getWest();
+    const north = bounds.getNorth();
+    const east = bounds.getEast();
+    const bbox = `${south},${west},${north},${east}`;
     const query = `[out:json][timeout:25];(${cat.query}(${bbox}););out center 200;`;
 
     try {
@@ -994,7 +1073,8 @@ export default function Home() {
             },
             geometry: {
               type: "Point" as const,
-              coordinates: [lon, lat],
+              // GeoJSON: [lng, lat]  — always longitude first
+              coordinates: [lon, lat] as Coord,
             },
           };
         })
@@ -1468,7 +1548,7 @@ export default function Home() {
       )}
       {basemap === "satellite-esri" && !measureActive && (
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 glass rounded-xl px-4 py-2 text-[11px] text-white/70 fade-in">
-          🛰️ Esri World Imagery · sharp detail · worldwide
+          🗰 Esri World Imagery · sharp detail · worldwide
         </div>
       )}
 
