@@ -20,6 +20,14 @@ const ESRI_TILES =
 const MAPTILER_S2_TILES =
   `https://api.maptiler.com/tiles/satellite-v2/{z}/{x}/{y}.jpg?key=${MAPTILER_KEY}`;
 
+// Multiple Overpass mirrors — we try each in order
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.openstreetmap.ru/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+];
+
 const POI_CATEGORIES = [
   { id: "restaurant", label: "Restaurants", icon: "🍽️", color: "#f97316", query: 'node["amenity"="restaurant"]' },
   { id: "cafe",       label: "Cafes",       icon: "☕", color: "#a16207", query: 'node["amenity"="cafe"]' },
@@ -129,6 +137,30 @@ function stepIcon(step: RouteStep) {
   return "→";
 }
 
+// Try each Overpass mirror in order until one succeeds
+async function fetchOverpass(query: string): Promise<any> {
+  let lastError: any = null;
+  for (const url of OVERPASS_ENDPOINTS) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "data=" + encodeURIComponent(query),
+      });
+      if (!res.ok) {
+        lastError = new Error(`${url} → HTTP ${res.status}`);
+        continue;
+      }
+      const data = await res.json();
+      return data;
+    } catch (e) {
+      lastError = e;
+      continue;
+    }
+  }
+  throw lastError ?? new Error("All Overpass mirrors failed");
+}
+
 export default function Home() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
@@ -184,7 +216,6 @@ export default function Home() {
     setFavorites(loadFavorites());
   }, []);
 
-  // ---------- Init map ----------
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
@@ -320,7 +351,6 @@ export default function Home() {
           clusterRadius: 50,
         });
       }
-
       if (!map.getLayer("poi-clusters")) {
         map.addLayer({
           id: "poi-clusters",
@@ -337,22 +367,13 @@ export default function Home() {
               30,
               "#a855f7",
             ],
-            "circle-radius": [
-              "step",
-              ["get", "point_count"],
-              16,
-              10,
-              20,
-              30,
-              24,
-            ],
+            "circle-radius": ["step", ["get", "point_count"], 16, 10, 20, 30, 24],
             "circle-stroke-width": 3,
             "circle-stroke-color": "#ffffff",
             "circle-opacity": 0.9,
           },
         });
       }
-
       if (!map.getLayer("poi-cluster-count")) {
         map.addLayer({
           id: "poi-cluster-count",
@@ -364,12 +385,9 @@ export default function Home() {
             "text-size": 12,
             "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
           },
-          paint: {
-            "text-color": "#ffffff",
-          },
+          paint: { "text-color": "#ffffff" },
         });
       }
-
       if (!map.getLayer("poi-points")) {
         map.addLayer({
           id: "poi-points",
@@ -443,26 +461,25 @@ export default function Home() {
         "top-left"
       );
 
-      // Cluster click → zoom
       map.on("click", "poi-clusters", (e: any) => {
         const features = map.queryRenderedFeatures(e.point, {
           layers: ["poi-clusters"],
         });
-        const clusterFeature = features[0] as any;
-        const clusterId = clusterFeature.properties.cluster_id;
-        const coords = clusterFeature.geometry.coordinates as [number, number];
+        const feature = features[0];
+        if (!feature || !feature.geometry || feature.geometry.type !== "Point") {
+          return;
+        }
+
+        const clusterId = feature.properties.cluster_id;
+        const coords = feature.geometry.coordinates as [number, number];
         (map.getSource("pois") as any)
           .getClusterExpansionZoom(clusterId)
           .then((zoom: number) => {
-            map.easeTo({
-              center: coords,
-              zoom,
-            });
+            map.easeTo({ center: coords, zoom });
           })
           .catch((err: any) => console.error(err));
       });
 
-      // Individual POI click → popup
       map.on("click", "poi-points", (e: any) => {
         const f = e.features[0];
         const coords = f.geometry.coordinates.slice();
@@ -502,7 +519,6 @@ export default function Home() {
     };
   }, []);
 
-  // ---------- Basemap switch ----------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -522,7 +538,6 @@ export default function Home() {
     }
   }, [basemap]);
 
-  // ---------- Style switch ----------
   useEffect(() => {
     const map = mapRef.current;
     if (!map || currentStyleRef.current === styleName) return;
@@ -958,11 +973,7 @@ export default function Home() {
     const query = `[out:json][timeout:25];(${cat.query}(${bbox}););out center 200;`;
 
     try {
-      const res = await fetch("https://overpass-api.de/api/interpreter", {
-        method: "POST",
-        body: "data=" + encodeURIComponent(query),
-      });
-      const data = await res.json();
+      const data = await fetchOverpass(query);
       const elements = data.elements ?? [];
       setPoiCount(elements.length);
 
@@ -994,8 +1005,8 @@ export default function Home() {
         features,
       });
     } catch (e) {
-      console.error(e);
-      showToast("Search failed — try again");
+      console.error("Overpass failed on all mirrors:", e);
+      showToast("Search failed — try again in a moment");
       setPoiCount(0);
     } finally {
       setPoiLoading(false);
