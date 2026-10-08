@@ -7,18 +7,14 @@ import MaplibreGeocoder from "@maplibre/maplibre-gl-geocoder";
 import "@maplibre/maplibre-gl-geocoder/dist/maplibre-gl-geocoder.css";
 
 // ===========================================================================
-// COORDINATE CONVENTIONS — READ BEFORE EDITING
-// ===========================================================================
+// COORDINATE CONVENTIONS
 // MapLibre API:      [lng, lat]
-// GeoJSON:           [lng, lat]  (longitude FIRST)
-// Nominatim JSON:    { lat: string, lon: string }  → parseFloat both
-// Nominatim GeoJSON: coordinates = [lng, lat]
+// GeoJSON:           [lng, lat]
+// Nominatim JSON:    { lat: string, lon: string }  -> parseFloat both
+// Photon GeoJSON:    coordinates = [lng, lat]
 // OSRM URL:          /route/v1/.../{lng},{lat};{lng},{lat}
-// Overpass bbox:     "south,west,north,east"
-// GPS API:           { latitude, longitude } → convert to [lng, lat]
-// Internal object:   { lng, lat }
-// Internal tuple:    [lng, lat]
-// NEVER flip lng/lat.
+// Open-Meteo:        { latitude, longitude } — max ~64 coords per request
+// GPS API:           { latitude, longitude } -> convert to [lng, lat]
 // ===========================================================================
 
 const MAPTILER_KEY = "TYASrHzRBDUEA63XTMiR";
@@ -30,28 +26,146 @@ const STYLES: Record<string, { url: string; label: string }> = {
   Dark:     { url: "https://tiles.openfreemap.org/styles/dark",     label: "Dark" },
 };
 
-// Esri World Imagery raster tiles
 const ESRI_TILES =
   "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
 
-// MapTiler satellite-v2 tile URL — {z}/{x}/{y} order confirmed from TileJSON
 const MAPTILER_S2_TILES =
   `https://api.maptiler.com/tiles/satellite-v2/{z}/{x}/{y}.jpg?key=${MAPTILER_KEY}`;
 
-// POI categories — Overpass query fragments
 const POI_CATEGORIES = [
-  { id: "restaurant", label: "Restaurants", icon: "🍽️", color: "#f97316", query: 'node["amenity"="restaurant"]' },
-  { id: "cafe",       label: "Cafes",       icon: "☕", color: "#a16207", query: 'node["amenity"="cafe"]' },
-  { id: "fast_food",  label: "Fast Food",   icon: "🍔", color: "#ef4444", query: 'node["amenity"="fast_food"]' },
-  { id: "fuel",       label: "Fuel",        icon: "⛽", color: "#0ea5e9", query: 'node["amenity"="fuel"]' },
-  { id: "atm",        label: "ATMs",        icon: "🏧", color: "#22c55e", query: 'node["amenity"="atm"]' },
-  { id: "pharmacy",   label: "Pharmacies",  icon: "💊", color: "#14b8a6", query: 'node["amenity"="pharmacy"]' },
-  { id: "hospital",   label: "Hospitals",   icon: "🏥", color: "#dc2626", query: 'node["amenity"="hospital"]' },
-  { id: "hotel",      label: "Hotels",      icon: "🏨", color: "#8b5cf6", query: 'node["tourism"="hotel"]' },
-  { id: "bank",       label: "Banks",       icon: "🏦", color: "#0891b2", query: 'node["amenity"="bank"]' },
-  { id: "parking",    label: "Parking",     icon: "🅿️", color: "#475569", query: 'node["amenity"="parking"]' },
-  { id: "school",     label: "Schools",     icon: "🏫", color: "#7c3aed", query: 'node["amenity"="school"]' },
-  { id: "supermarket",label: "Markets",     icon: "🛒", color: "#16a34a", query: 'node["shop"="supermarket"]' },
+  { id: "restaurant",  label: "Restaurants", icon: "🍽️", color: "#f97316" },
+  { id: "cafe",        label: "Cafes",       icon: "☕", color: "#a16207" },
+  { id: "fast_food",   label: "Fast Food",   icon: "🍔", color: "#ef4444" },
+  { id: "bar",         label: "Bars",        icon: "🍺", color: "#b45309" },
+  { id: "fuel",        label: "Fuel",        icon: "⛽", color: "#0ea5e9" },
+  { id: "atm",         label: "ATMs",        icon: "🏧", color: "#22c55e" },
+  { id: "bank",        label: "Banks",       icon: "🏦", color: "#0891b2" },
+  { id: "pharmacy",    label: "Pharmacies",  icon: "💊", color: "#14b8a6" },
+  { id: "hospital",    label: "Hospitals",   icon: "🏥", color: "#dc2626" },
+  { id: "clinic",      label: "Clinics",     icon: "🩺", color: "#ef4444" },
+  { id: "hotel",       label: "Hotels",      icon: "🏨", color: "#8b5cf6" },
+  { id: "parking",     label: "Parking",     icon: "🅿️", color: "#475569" },
+  { id: "school",      label: "Schools",     icon: "🏫", color: "#7c3aed" },
+  { id: "supermarket", label: "Markets",     icon: "🛒", color: "#16a34a" },
+  { id: "mall",        label: "Malls",       icon: "🏬", color: "#db2777" },
+  { id: "gym",         label: "Gyms",        icon: "🏋️", color: "#ea580c" },
+  { id: "park",        label: "Parks",       icon: "🌳", color: "#22c55e" },
+  { id: "mosque",      label: "Mosques",     icon: "🕌", color: "#059669" },
+  { id: "church",      label: "Churches",    icon: "⛪", color: "#7c3aed" },
+  { id: "police",      label: "Police",      icon: "🚓", color: "#1d4ed8" },
+];
+
+type WeatherLayerDef = {
+  id: string;
+  label: string;
+  icon: string;
+  dataField: string;
+  colorLow: string;
+  colorHigh: string;
+  minValue: number;
+  maxValue: number;
+  legend: { stops: { at: number; color: string; label: string }[]; unit: string };
+};
+
+const WEATHER_LAYERS: WeatherLayerDef[] = [
+  {
+    id: "temp",
+    label: "Temperature",
+    icon: "🌡️",
+    dataField: "temperature_2m",
+    colorLow: "#3b82f6",
+    colorHigh: "#ef4444",
+    minValue: -10,
+    maxValue: 45,
+    legend: {
+      unit: "°C",
+      stops: [
+        { at: -10, color: "#3b82f6", label: "-10" },
+        { at: 0,   color: "#22d3ee", label: "0" },
+        { at: 15,  color: "#22c55e", label: "15" },
+        { at: 25,  color: "#eab308", label: "25" },
+        { at: 35,  color: "#f97316", label: "35" },
+        { at: 45,  color: "#ef4444", label: "45" },
+      ],
+    },
+  },
+  {
+    id: "wind",
+    label: "Wind",
+    icon: "💨",
+    dataField: "wind_speed_10m",
+    colorLow: "#e0f2fe",
+    colorHigh: "#0c4a6e",
+    minValue: 0,
+    maxValue: 40,
+    legend: {
+      unit: "km/h",
+      stops: [
+        { at: 0,  color: "#e0f2fe", label: "0" },
+        { at: 10, color: "#7dd3fc", label: "10" },
+        { at: 20, color: "#3b82f6", label: "20" },
+        { at: 30, color: "#8b5cf6", label: "30" },
+        { at: 40, color: "#0c4a6e", label: "40+" },
+      ],
+    },
+  },
+  {
+    id: "clouds",
+    label: "Clouds",
+    icon: "☁️",
+    dataField: "cloud_cover",
+    colorLow: "#0f172a",
+    colorHigh: "#f1f5f9",
+    minValue: 0,
+    maxValue: 100,
+    legend: {
+      unit: "%",
+      stops: [
+        { at: 0,   color: "#0f172a", label: "0" },
+        { at: 50,  color: "#64748b", label: "50" },
+        { at: 100, color: "#f1f5f9", label: "100" },
+      ],
+    },
+  },
+  {
+    id: "pressure",
+    label: "Pressure",
+    icon: "📊",
+    dataField: "pressure_msl",
+    colorLow: "#7c3aed",
+    colorHigh: "#ef4444",
+    minValue: 970,
+    maxValue: 1050,
+    legend: {
+      unit: "hPa",
+      stops: [
+        { at: 970,  color: "#7c3aed", label: "970" },
+        { at: 1000, color: "#3b82f6", label: "1000" },
+        { at: 1013, color: "#22c55e", label: "1013" },
+        { at: 1030, color: "#eab308", label: "1030" },
+        { at: 1050, color: "#ef4444", label: "1050+" },
+      ],
+    },
+  },
+  {
+    id: "humidity",
+    label: "Humidity",
+    icon: "💧",
+    dataField: "relative_humidity_2m",
+    colorLow: "#fef3c7",
+    colorHigh: "#0369a1",
+    minValue: 0,
+    maxValue: 100,
+    legend: {
+      unit: "%",
+      stops: [
+        { at: 0,   color: "#fef3c7", label: "0" },
+        { at: 40,  color: "#7dd3fc", label: "40" },
+        { at: 70,  color: "#0ea5e9", label: "70" },
+        { at: 100, color: "#0369a1", label: "100" },
+      ],
+    },
+  },
 ];
 
 type BasemapMode = "vector" | "satellite-esri" | "satellite-s2";
@@ -79,11 +193,22 @@ type Favorite = {
   createdAt: number;
 };
 
-const FAV_KEY = "mymaps:favorites";
+type WeatherPoint = {
+  lng: number;
+  lat: number;
+  temperature: number;
+  windSpeed: number;
+  windDirection: number;
+  precipitation: number;
+  cloudCover: number;
+  humidity: number;
+  pressure: number;
+  code: number;
+};
 
-function lngLatToCoord(p: LngLat): Coord {
-  return [p.lng, p.lat];
-}
+type RainFrame = { path: string; time: number };
+
+const FAV_KEY = "mymaps:favorites";
 
 function loadFavorites(): Favorite[] {
   try {
@@ -100,7 +225,6 @@ function saveFavorites(list: Favorite[]) {
   } catch {}
 }
 
-// Haversine distance in meters. Inputs are [lng, lat] tuples.
 function haversine(a: Coord, b: Coord): number {
   const R = 6371000;
   const toRad = (d: number) => (d * Math.PI) / 180;
@@ -114,7 +238,6 @@ function haversine(a: Coord, b: Coord): number {
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
-// Spherical excess area. Inputs are [lng, lat] tuples.
 function polygonArea(coords: Coord[]): number {
   if (coords.length < 3) return 0;
   const R = 6371000;
@@ -160,9 +283,47 @@ function stepIcon(step: RouteStep) {
   return "→";
 }
 
-// ===========================================================================
-// MAIN COMPONENT
-// ===========================================================================
+function weatherCodeLabel(code: number): string {
+  if (code === 0) return "Clear";
+  if (code === 1) return "Mostly clear";
+  if (code === 2) return "Partly cloudy";
+  if (code === 3) return "Overcast";
+  if (code === 45 || code === 48) return "Fog";
+  if (code >= 51 && code <= 57) return "Drizzle";
+  if (code >= 61 && code <= 67) return "Rain";
+  if (code >= 71 && code <= 77) return "Snow";
+  if (code >= 80 && code <= 82) return "Rain showers";
+  if (code >= 85 && code <= 86) return "Snow showers";
+  if (code >= 95 && code <= 99) return "Thunderstorm";
+  return "Unknown";
+}
+
+function windDirectionLabel(deg: number): string {
+  const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  return dirs[Math.round(deg / 45) % 8];
+}
+
+function PalterLogo({ size = 32 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 64 64" aria-hidden="true">
+      <defs>
+        <linearGradient id="palterGrad" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#6366f1" />
+          <stop offset="1" stopColor="#a855f7" />
+        </linearGradient>
+      </defs>
+      <rect width="64" height="64" rx="14" fill="url(#palterGrad)" />
+      <path
+        d="M20 44V20h9.5c4.5 0 7.5 3 7.5 7.5S34 35 29.5 35H26v9h-6z"
+        fill="white"
+      />
+      <circle cx="44" cy="22" r="3.5" fill="white" />
+      <circle cx="44" cy="34" r="3.5" fill="white" />
+      <circle cx="44" cy="46" r="3.5" fill="white" />
+    </svg>
+  );
+}
+
 export default function Home() {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
@@ -175,6 +336,12 @@ export default function Home() {
   const routeFromMarkerRef = useRef<any>(null);
   const routeToMarkerRef = useRef<any>(null);
   const poiAbortRef = useRef<AbortController | null>(null);
+  const poiCacheRef = useRef<Map<string, any>>(new Map());
+  const weatherPointMarkerRef = useRef<any>(null);
+  const weatherGridAbortRef = useRef<AbortController | null>(null);
+  const weatherRefreshTimerRef = useRef<any>(null);
+  const rainFramesRef = useRef<RainFrame[]>([]);
+  const rainPlayTimerRef = useRef<any>(null);
 
   const [styleName, setStyleName] = useState<string>("Liberty");
   const currentStyleRef = useRef<string>("Liberty");
@@ -211,8 +378,18 @@ export default function Home() {
   const [toResults, setToResults] = useState<{ display_name: string; lat: number; lon: number }[]>([]);
   const [activeInput, setActiveInput] = useState<"from" | "to" | null>(null);
 
-  // Mobile slide-in panel state
   const [panelOpen, setPanelOpen] = useState(false);
+
+  const [weatherOpen, setWeatherOpen] = useState(false);
+  const [activeWeatherLayer, setActiveWeatherLayer] = useState<string | null>(null);
+  const [weatherOpacity, setWeatherOpacity] = useState(0.75);
+  const [weatherPoint, setWeatherPoint] = useState<WeatherPoint | null>(null);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherFetching, setWeatherFetching] = useState(false);
+
+  const [rainFrames, setRainFrames] = useState<RainFrame[]>([]);
+  const [rainFrameIdx, setRainFrameIdx] = useState(0);
+  const [rainPlaying, setRainPlaying] = useState(true);
 
   useEffect(() => {
     basemapRef.current = basemap;
@@ -222,9 +399,7 @@ export default function Home() {
     setFavorites(loadFavorites());
   }, []);
 
-  // -------------------------------------------------------------------------
   // MAP INIT
-  // -------------------------------------------------------------------------
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
@@ -242,13 +417,11 @@ export default function Home() {
     });
 
     map.addControl(new maplibregl.NavigationControl(), "top-right");
-    map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left");
 
     const installRasterLayers = () => {
       const styleLayers = map.getStyle()?.layers ?? [];
       const firstSymbolId = styleLayers.find((l: any) => l.type === "symbol")?.id;
 
-      // Esri satellite raster
       if (!map.getSource("esri-sat")) {
         map.addSource("esri-sat", {
           type: "raster",
@@ -264,7 +437,6 @@ export default function Home() {
         );
       }
 
-      // MapTiler satellite raster
       if (!map.getSource("s2-sat")) {
         map.addSource("s2-sat", {
           type: "raster",
@@ -280,7 +452,6 @@ export default function Home() {
         );
       }
 
-      // Measure layers
       if (!map.getSource("measure-line")) {
         map.addSource("measure-line", {
           type: "geojson",
@@ -315,7 +486,6 @@ export default function Home() {
         });
       }
 
-      // Route layers
       if (!map.getSource("route")) {
         map.addSource("route", {
           type: "geojson",
@@ -355,51 +525,11 @@ export default function Home() {
         );
       }
 
-      // POI clustering source
       if (!map.getSource("pois")) {
         map.addSource("pois", {
           type: "geojson",
           data: { type: "FeatureCollection", features: [] },
-          cluster: true,
-          clusterMaxZoom: 15,
-          clusterRadius: 50,
-        });
-      }
-      if (!map.getLayer("poi-clusters")) {
-        map.addLayer({
-          id: "poi-clusters",
-          type: "circle",
-          source: "pois",
-          filter: ["has", "point_count"],
-          paint: {
-            "circle-color": [
-              "step",
-              ["get", "point_count"],
-              "#6366f1",
-              10,
-              "#8b5cf6",
-              30,
-              "#a855f7",
-            ],
-            "circle-radius": ["step", ["get", "point_count"], 16, 10, 20, 30, 24],
-            "circle-stroke-width": 3,
-            "circle-stroke-color": "#ffffff",
-            "circle-opacity": 0.9,
-          },
-        });
-      }
-      if (!map.getLayer("poi-cluster-count")) {
-        map.addLayer({
-          id: "poi-cluster-count",
-          type: "symbol",
-          source: "pois",
-          filter: ["has", "point_count"],
-          layout: {
-            "text-field": "{point_count_abbreviated}",
-            "text-size": 12,
-            "text-font": ["Open Sans Bold", "Arial Unicode MS Bold"],
-          },
-          paint: { "text-color": "#ffffff" },
+          cluster: false,
         });
       }
       if (!map.getLayer("poi-points")) {
@@ -407,7 +537,6 @@ export default function Home() {
           id: "poi-points",
           type: "circle",
           source: "pois",
-          filter: ["!", ["has", "point_count"]],
           paint: {
             "circle-color": ["get", "color"],
             "circle-radius": 8,
@@ -417,7 +546,62 @@ export default function Home() {
         });
       }
 
-      // Enforce current basemap visibility after any style reload
+      // Weather heatmap grid
+      if (!map.getSource("weather-grid")) {
+        map.addSource("weather-grid", {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+      }
+      if (!map.getLayer("weather-grid-layer")) {
+        map.addLayer(
+          {
+            id: "weather-grid-layer",
+            type: "circle",
+            source: "weather-grid",
+            layout: { visibility: "none" },
+            paint: {
+              "circle-radius": ["interpolate", ["linear"], ["zoom"], 3, 22, 6, 34, 10, 50, 14, 70],
+              "circle-opacity": 0.85,
+              "circle-blur": 0.6,
+              "circle-color": [
+                "interpolate",
+                ["linear"],
+                ["get", "value"],
+                0, ["get", "colorLow"],
+                1, ["get", "colorHigh"],
+              ] as any,
+            },
+          },
+          firstSymbolId
+        );
+      }
+
+      // Wind arrows
+      if (!map.getSource("weather-wind-arrows")) {
+        map.addSource("weather-wind-arrows", {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
+        });
+      }
+      if (!map.getLayer("weather-wind-arrows-layer")) {
+        map.addLayer({
+          id: "weather-wind-arrows-layer",
+          type: "symbol",
+          source: "weather-wind-arrows",
+          layout: {
+            visibility: "none",
+            "icon-image": "wind-arrow",
+            "icon-size": ["interpolate", ["linear"], ["zoom"], 3, 0.4, 8, 0.6, 12, 0.85],
+            "icon-rotate": ["get", "bearing"],
+            "icon-rotation-alignment": "map",
+            "icon-allow-overlap": true,
+            "icon-ignore-placement": true,
+          },
+          paint: { "icon-opacity": 0.9 },
+        });
+      }
+
       const current = basemapRef.current;
       if (map.getLayer("esri-sat-layer")) {
         map.setLayoutProperty(
@@ -439,7 +623,32 @@ export default function Home() {
     map.on("load", installRasterLayers);
 
     map.on("load", () => {
-      // Geocoder
+      // Wind arrow sprite
+      const size = 48;
+      const canvas = document.createElement("canvas");
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext("2d")!;
+      ctx.clearRect(0, 0, size, size);
+      ctx.fillStyle = "#0f172a";
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(size / 2, 6);
+      ctx.lineTo(size - 10, size - 6);
+      ctx.lineTo(size / 2, size - 14);
+      ctx.lineTo(10, size - 6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      if (!map.hasImage("wind-arrow")) {
+        map.addImage("wind-arrow", {
+          width: size,
+          height: size,
+          data: ctx.getImageData(0, 0, size, size).data,
+        } as any);
+      }
+
       const geocoderApi = {
         forwardGeocode: async (config: any) => {
           const features: any[] = [];
@@ -477,25 +686,6 @@ export default function Home() {
         "top-left"
       );
 
-      // Cluster click → zoom
-      map.on("click", "poi-clusters", (e: any) => {
-        const features = map.queryRenderedFeatures(e.point, {
-          layers: ["poi-clusters"],
-        });
-        const clusterFeature = features[0];
-        if (!clusterFeature || !("coordinates" in clusterFeature.geometry)) return;
-
-        const clusterId = clusterFeature.properties.cluster_id;
-        const coords = clusterFeature.geometry.coordinates as Coord;
-        (map.getSource("pois") as any)
-          .getClusterExpansionZoom(clusterId)
-          .then((zoom: number) => {
-            map.easeTo({ center: coords, zoom });
-          })
-          .catch((err: any) => console.error(err));
-      });
-
-      // POI point click → popup
       map.on("click", "poi-points", (e: any) => {
         const f = e.features[0];
         const coords = f.geometry.coordinates.slice() as Coord;
@@ -509,17 +699,59 @@ export default function Home() {
           .addTo(map);
       });
 
-      map.on("mouseenter", "poi-clusters", () => {
-        map.getCanvas().style.cursor = "pointer";
-      });
-      map.on("mouseleave", "poi-clusters", () => {
-        map.getCanvas().style.cursor = "";
-      });
       map.on("mouseenter", "poi-points", () => {
         map.getCanvas().style.cursor = "pointer";
       });
       map.on("mouseleave", "poi-points", () => {
         map.getCanvas().style.cursor = "";
+      });
+
+      // Point forecast on click
+      map.on("click", async (e: any) => {
+        if (!weatherOpen) return;
+        const lat = e.lngLat.lat;
+        const lng = e.lngLat.lng;
+        setWeatherLoading(true);
+
+        if (weatherPointMarkerRef.current) weatherPointMarkerRef.current.remove();
+        const el = document.createElement("div");
+        el.style.cssText = `
+          width: 14px; height: 14px; border-radius: 50%;
+          background: #f97316; border: 2px solid white;
+          box-shadow: 0 0 0 3px rgba(249,115,22,0.35);
+        `;
+        weatherPointMarkerRef.current = new maplibregl.Marker({ element: el })
+          .setLngLat([lng, lat])
+          .addTo(map);
+
+        try {
+          const res = await fetch(
+            `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,relative_humidity_2m,precipitation,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,weather_code`
+          );
+          const data = await res.json();
+          const c = data?.current;
+          if (!c) {
+            setWeatherLoading(false);
+            return;
+          }
+          setWeatherPoint({
+            lng,
+            lat,
+            temperature: c.temperature_2m ?? 0,
+            humidity: c.relative_humidity_2m ?? 0,
+            precipitation: c.precipitation ?? 0,
+            cloudCover: c.cloud_cover ?? 0,
+            pressure: c.pressure_msl ?? 0,
+            windSpeed: c.wind_speed_10m ?? 0,
+            windDirection: c.wind_direction_10m ?? 0,
+            code: c.weather_code ?? 0,
+          });
+        } catch (err) {
+          console.error(err);
+          showToast("Weather fetch failed");
+        } finally {
+          setWeatherLoading(false);
+        }
       });
     });
 
@@ -530,19 +762,17 @@ export default function Home() {
         navigator.geolocation.clearWatch(userWatchRef.current);
         userWatchRef.current = null;
       }
+      if (weatherRefreshTimerRef.current) clearTimeout(weatherRefreshTimerRef.current);
+      if (rainPlayTimerRef.current) clearInterval(rainPlayTimerRef.current);
       map.remove();
       mapRef.current = null;
     };
-  }, []);
+  }, [weatherOpen]);
 
-  // -------------------------------------------------------------------------
-  // BASEMAP SWITCH
-  // -------------------------------------------------------------------------
+  // Basemap toggle
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-
-    // If layers aren't installed yet, wait for style.load to apply
     const apply = () => {
       if (map.getLayer("esri-sat-layer")) {
         map.setLayoutProperty(
@@ -559,17 +789,248 @@ export default function Home() {
         );
       }
     };
-
-    if (map.isStyleLoaded() && map.getLayer("esri-sat-layer")) {
-      apply();
-    } else {
-      map.once("style.load", apply);
-    }
+    if (map.isStyleLoaded() && map.getLayer("esri-sat-layer")) apply();
+    else map.once("style.load", apply);
   }, [basemap]);
 
-  // -------------------------------------------------------------------------
-  // STYLE SWITCH
-  // -------------------------------------------------------------------------
+  // Load RainViewer frames once
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await fetch("/api/rainviewer");
+        if (!res.ok) return;
+        const data = await res.json();
+        const host: string = data.host ?? "https://tilecache.rainviewer.com";
+        const radar = data.radar;
+        const past = radar?.past ?? [];
+        const nowcast = radar?.nowcast ?? [];
+        const frames: RainFrame[] = [...past, ...nowcast].map((f: any) => ({
+          path: host + f.path + "/256/{z}/{x}/{y}/2/1_1.png",
+          time: f.time * 1000,
+        }));
+        if (cancelled || frames.length === 0) return;
+        rainFramesRef.current = frames;
+        setRainFrames(frames);
+        setRainFrameIdx(Math.max(0, past.length - 1));
+
+        const install = () => {
+          if (cancelled) return;
+          if (!map.getSource("weather-rain")) {
+            map.addSource("weather-rain", {
+              type: "raster",
+              tiles: [frames[Math.max(0, past.length - 1)].path],
+              tileSize: 256,
+            });
+          }
+          if (!map.getLayer("weather-rain-layer")) {
+            const styleLayers = map.getStyle()?.layers ?? [];
+            const firstSymbolId = styleLayers.find((l: any) => l.type === "symbol")?.id;
+            map.addLayer(
+              {
+                id: "weather-rain-layer",
+                type: "raster",
+                source: "weather-rain",
+                paint: { "raster-opacity": 0.75 },
+                layout: { visibility: "none" },
+              },
+              firstSymbolId
+            );
+          }
+        };
+        if (map.isStyleLoaded()) install();
+        else map.once("style.load", install);
+      } catch (e) {
+        console.error("RainViewer load failed:", e);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Apply rain frame
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || rainFrames.length === 0) return;
+    const frame = rainFrames[Math.min(rainFrameIdx, rainFrames.length - 1)];
+    const src = map.getSource("weather-rain") as any;
+    if (src) src.setTiles([frame.path]);
+  }, [rainFrameIdx, rainFrames]);
+
+  // Rain animation loop
+  useEffect(() => {
+    if (!rainPlaying || rainFrames.length === 0) return;
+    const id = setInterval(() => {
+      setRainFrameIdx((i) => (i + 1) % rainFrames.length);
+    }, 500);
+    rainPlayTimerRef.current = id;
+    return () => clearInterval(id);
+  }, [rainPlaying, rainFrames]);
+
+  // Weather grid + wind arrows
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const def = WEATHER_LAYERS.find((l) => l.id === activeWeatherLayer);
+    const isHeatmap = activeWeatherLayer && activeWeatherLayer !== "rain" && def;
+
+    if (map.getLayer("weather-rain-layer")) {
+      map.setLayoutProperty(
+        "weather-rain-layer",
+        "visibility",
+        activeWeatherLayer === "rain" ? "visible" : "none"
+      );
+    }
+
+    if (map.getLayer("weather-wind-arrows-layer")) {
+      map.setLayoutProperty(
+        "weather-wind-arrows-layer",
+        "visibility",
+        activeWeatherLayer === "wind" ? "visible" : "none"
+      );
+    }
+
+    if (!isHeatmap || !def) {
+      if (map.getLayer("weather-grid-layer")) {
+        map.setLayoutProperty("weather-grid-layer", "visibility", "none");
+      }
+      return;
+    }
+
+    weatherGridAbortRef.current?.abort();
+    const controller = new AbortController();
+    weatherGridAbortRef.current = controller;
+
+    setWeatherFetching(true);
+
+    const doFetch = async () => {
+      const bounds = map.getBounds();
+      const south = bounds.getSouth();
+      const west = bounds.getWest();
+      const north = bounds.getNorth();
+      const east = bounds.getEast();
+
+      // 8x8 grid = 64 points — safe for Open-Meteo free tier
+      const GRID = 8;
+      const lats: number[] = [];
+      const lngs: number[] = [];
+      for (let i = 0; i < GRID; i++) {
+        for (let j = 0; j < GRID; j++) {
+          lats.push(south + ((north - south) * i) / (GRID - 1));
+          lngs.push(west + ((east - west) * j) / (GRID - 1));
+        }
+      }
+
+      const field =
+        activeWeatherLayer === "wind"
+          ? "wind_speed_10m,wind_direction_10m"
+          : def.dataField;
+
+      const url =
+        `https://api.open-meteo.com/v1/forecast?` +
+        `latitude=${lats.map((v) => v.toFixed(3)).join(",")}` +
+        `&longitude=${lngs.map((v) => v.toFixed(3)).join(",")}` +
+        `&current=${field}`;
+
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+          setWeatherFetching(false);
+          return;
+        }
+        const data = await res.json();
+
+        // Open-Meteo returns an array when multiple coords are given
+        const items = Array.isArray(data) ? data : [data];
+        const heatFeatures: any[] = [];
+        const arrowFeatures: any[] = [];
+
+        for (const item of items) {
+          if (!item) continue;
+          const lat = item.latitude;
+          const lng = item.longitude;
+          const cur = item.current;
+          if (!cur || typeof lat !== "number" || typeof lng !== "number") continue;
+
+          const value = cur[def.dataField];
+          if (typeof value !== "number") continue;
+
+          const norm = Math.max(
+            0,
+            Math.min(1, (value - def.minValue) / (def.maxValue - def.minValue))
+          );
+          heatFeatures.push({
+            type: "Feature",
+            properties: {
+              value: norm,
+              colorLow: def.colorLow,
+              colorHigh: def.colorHigh,
+            },
+            geometry: { type: "Point", coordinates: [lng, lat] },
+          });
+
+          if (activeWeatherLayer === "wind") {
+            const dir = cur.wind_direction_10m;
+            if (typeof dir === "number") {
+              arrowFeatures.push({
+                type: "Feature",
+                properties: { bearing: dir },
+                geometry: { type: "Point", coordinates: [lng, lat] },
+              });
+            }
+          }
+        }
+
+        (map.getSource("weather-grid") as any)?.setData({
+          type: "FeatureCollection",
+          features: heatFeatures,
+        });
+        (map.getSource("weather-wind-arrows") as any)?.setData({
+          type: "FeatureCollection",
+          features: arrowFeatures,
+        });
+
+        if (map.getLayer("weather-grid-layer")) {
+          map.setLayoutProperty("weather-grid-layer", "visibility", "visible");
+          map.setPaintProperty(
+            "weather-grid-layer",
+            "circle-opacity",
+            weatherOpacity * 0.9
+          );
+        }
+        if (map.getLayer("weather-rain-layer")) {
+          map.setPaintProperty("weather-rain-layer", "raster-opacity", weatherOpacity);
+        }
+      } catch (err: any) {
+        if (err?.name !== "AbortError") console.error("Weather grid failed:", err);
+      } finally {
+        setWeatherFetching(false);
+      }
+    };
+
+    doFetch();
+
+    const onMoveEnd = () => {
+      if (weatherRefreshTimerRef.current) clearTimeout(weatherRefreshTimerRef.current);
+      weatherRefreshTimerRef.current = setTimeout(() => {
+        doFetch();
+      }, 800);
+    };
+    map.on("moveend", onMoveEnd);
+
+    return () => {
+      map.off("moveend", onMoveEnd);
+      if (weatherRefreshTimerRef.current) clearTimeout(weatherRefreshTimerRef.current);
+    };
+  }, [activeWeatherLayer, weatherOpacity, weatherOpen]);
+
+  // Style switch
   useEffect(() => {
     const map = mapRef.current;
     if (!map || currentStyleRef.current === styleName) return;
@@ -596,9 +1057,6 @@ export default function Home() {
     return el;
   };
 
-  // -------------------------------------------------------------------------
-  // PICK FROM/TO ON MAP
-  // -------------------------------------------------------------------------
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !pickMode) return;
@@ -617,15 +1075,12 @@ export default function Home() {
     return () => map.off("click", handler);
   }, [pickMode]);
 
-  // -------------------------------------------------------------------------
-  // SYNC ROUTE MARKERS
-  // -------------------------------------------------------------------------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
     if (routeFrom) {
-      const ll = lngLatToCoord(routeFrom);
+      const ll: Coord = [routeFrom.lng, routeFrom.lat];
       if (routeFromMarkerRef.current) {
         routeFromMarkerRef.current.setLngLat(ll);
       } else {
@@ -647,7 +1102,7 @@ export default function Home() {
     }
 
     if (routeTo) {
-      const ll = lngLatToCoord(routeTo);
+      const ll: Coord = [routeTo.lng, routeTo.lat];
       if (routeToMarkerRef.current) {
         routeToMarkerRef.current.setLngLat(ll);
       } else {
@@ -669,9 +1124,6 @@ export default function Home() {
     }
   }, [routeFrom, routeTo]);
 
-  // -------------------------------------------------------------------------
-  // FETCH ROUTE — OSRM expects {lng},{lat};{lng},{lat}
-  // -------------------------------------------------------------------------
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -683,12 +1135,10 @@ export default function Home() {
       });
       return;
     }
-
     const url =
       `https://router.project-osrm.org/route/v1/driving/` +
       `${routeFrom.lng},${routeFrom.lat};${routeTo.lng},${routeTo.lat}` +
       `?overview=full&geometries=geojson&steps=true`;
-
     setRouteLoading(true);
     fetch(url)
       .then((r) => r.json())
@@ -703,9 +1153,7 @@ export default function Home() {
         setRouteInfo({ distance: route.distance, duration: route.duration, steps });
         (map.getSource("route") as any)?.setData({
           type: "FeatureCollection",
-          features: [
-            { type: "Feature", properties: {}, geometry: route.geometry },
-          ],
+          features: [{ type: "Feature", properties: {}, geometry: route.geometry }],
         });
         const coords = route.geometry.coordinates as Coord[];
         const bounds = coords.reduce(
@@ -731,9 +1179,6 @@ export default function Home() {
     setToQuery("");
   }
 
-  // -------------------------------------------------------------------------
-  // ADDRESS SEARCH — Nominatim JSON returns lat/lon as strings
-  // -------------------------------------------------------------------------
   async function searchAddress(query: string, which: "from" | "to") {
     if (!query.trim()) {
       if (which === "from") setFromResults([]);
@@ -763,7 +1208,6 @@ export default function Home() {
     r: { lat: number; lon: number; display_name: string },
     which: "from" | "to"
   ) {
-    // Internal format: { lng, lat }
     const pt: LngLat = { lng: r.lon, lat: r.lat };
     if (which === "from") {
       setRouteFrom(pt);
@@ -777,9 +1221,6 @@ export default function Home() {
     setActiveInput(null);
   }
 
-  // -------------------------------------------------------------------------
-  // FAVORITES
-  // -------------------------------------------------------------------------
   function openSaveDialog() {
     const map = mapRef.current;
     if (!map) return;
@@ -795,7 +1236,6 @@ export default function Home() {
     const fav: Favorite = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       name: saveName.trim() || "Untitled",
-      // Stored as [lng, lat] tuple — matches MapLibre flyTo
       center: [c.lng, c.lat],
       zoom: map.getZoom(),
       bearing: map.getBearing(),
@@ -831,9 +1271,6 @@ export default function Home() {
     });
   }
 
-  // -------------------------------------------------------------------------
-  // GPS
-  // -------------------------------------------------------------------------
   function makeUserDot() {
     const wrap = document.createElement("div");
     wrap.style.cssText = `position: relative; width: 20px; height: 20px;`;
@@ -876,7 +1313,6 @@ export default function Home() {
     showToast("Getting your location…", 1500);
     userWatchRef.current = navigator.geolocation.watchPosition(
       (pos) => {
-        // GPS gives { latitude, longitude } — convert to [lng, lat]
         const { longitude, latitude } = pos.coords;
         const ll: Coord = [longitude, latitude];
         if (!userMarkerRef.current) {
@@ -904,9 +1340,6 @@ export default function Home() {
     );
   }
 
-  // -------------------------------------------------------------------------
-  // MEASURE
-  // -------------------------------------------------------------------------
   function updateMeasureLayers() {
     const map = mapRef.current;
     if (!map) return;
@@ -1006,14 +1439,10 @@ export default function Home() {
     measureHandlerRef.current = handler;
   }
 
-  // -------------------------------------------------------------------------
-  // POI SEARCH — goes through our own API route to avoid CORS + 406
-  // -------------------------------------------------------------------------
   async function loadPOIs(categoryId: string) {
     const map = mapRef.current;
     if (!map) return;
 
-    // Toggle off
     if (activeCategory === categoryId) {
       (map.getSource("pois") as any)?.setData({
         type: "FeatureCollection",
@@ -1025,12 +1454,11 @@ export default function Home() {
     }
 
     const zoom = map.getZoom();
-    if (zoom < 10) {
-      showToast("Zoom in closer to search for nearby places", 3000);
+    if (zoom < 8) {
+      showToast("Zoom in to search for nearby places", 3000);
       return;
     }
 
-    // Cancel any in-flight request
     poiAbortRef.current?.abort();
     const controller = new AbortController();
     poiAbortRef.current = controller;
@@ -1041,88 +1469,94 @@ export default function Home() {
 
     const cat = POI_CATEGORIES.find((c) => c.id === categoryId)!;
     const bounds = map.getBounds();
-    // Overpass bbox order: south,west,north,east
-    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
-    const query = `[out:json][timeout:25];(${cat.query}(${bbox}););out center 200;`;
+
+    const south = parseFloat(bounds.getSouth().toFixed(4));
+    const west  = parseFloat(bounds.getWest().toFixed(4));
+    const north = parseFloat(bounds.getNorth().toFixed(4));
+    const east  = parseFloat(bounds.getEast().toFixed(4));
+
+    const cacheKey = `${categoryId}|${south}|${west}|${north}|${east}`;
+    const cached = poiCacheRef.current.get(cacheKey);
+    if (cached) {
+      applyPOIsToMap(cached);
+      setPoiCount(cached.length);
+      if (cached.length === 0) showToast(`No ${cat.label.toLowerCase()} found`);
+      setPoiLoading(false);
+      return;
+    }
 
     try {
       const res = await fetch("/api/pois", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({
+          category: cat.id,
+          bounds: { south, west, north, east },
+          limit: 200,
+        }),
         signal: controller.signal,
       });
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(`API ${res.status}: ${text}`);
+        throw new Error(`${res.status}: ${text}`);
       }
       const data = await res.json();
-      const elements = data.elements ?? [];
+      const rawFeatures = data.features ?? [];
+      if (rawFeatures.length === 0) showToast(`No ${cat.label.toLowerCase()} found`);
+      setPoiCount(rawFeatures.length);
 
-      if (elements.length === 0) showToast(`No ${cat.label.toLowerCase()} found`);
-      setPoiCount(elements.length);
+      const features = rawFeatures.map((f: any) => ({
+        type: "Feature" as const,
+        properties: {
+          name: f.properties?.name ?? cat.label,
+          category: cat.label,
+          icon: cat.icon,
+          color: cat.color,
+        },
+        geometry: { type: "Point" as const, coordinates: f.geometry.coordinates as Coord },
+      }));
 
-      // GeoJSON coordinates are [lng, lat]
-      const features = elements
-        .map((el: any) => {
-          const lat = el.lat ?? el.center?.lat;
-          const lon = el.lon ?? el.center?.lon;
-          if (!lat || !lon) return null;
-          return {
-            type: "Feature" as const,
-            properties: {
-              name: el.tags?.name ?? cat.label,
-              category: cat.label,
-              icon: cat.icon,
-              color: cat.color,
-            },
-            geometry: {
-              type: "Point" as const,
-              coordinates: [lon, lat] as Coord,
-            },
-          };
-        })
-        .filter(Boolean);
-
-      (map.getSource("pois") as any)?.setData({
-        type: "FeatureCollection",
-        features,
-      });
+      poiCacheRef.current.set(cacheKey, features);
+      if (poiCacheRef.current.size > 100) {
+        const firstKey = poiCacheRef.current.keys().next().value;
+        if (firstKey) poiCacheRef.current.delete(firstKey);
+      }
+      applyPOIsToMap(features);
     } catch (e: any) {
       if (e?.name === "AbortError") return;
       console.error("POI search failed:", e);
-      showToast("Search failed — try again");
+      showToast("Search failed — try again", 3000);
       setPoiCount(0);
     } finally {
       setPoiLoading(false);
     }
   }
 
-  // ===========================================================================
-  // RENDER
-  // ===========================================================================
+  function applyPOIsToMap(features: any[]) {
+    const map = mapRef.current;
+    if (!map) return;
+    (map.getSource("pois") as any)?.setData({
+      type: "FeatureCollection",
+      features,
+    });
+  }
+
+  const activeLayerDef = WEATHER_LAYERS.find((l) => l.id === activeWeatherLayer) || null;
+
   return (
     <div className="relative w-screen h-screen overflow-hidden">
-      {/* =============================== */}
-      {/* BRAND HEADER (top center)       */}
-      {/* =============================== */}
       <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 glass rounded-2xl px-3 py-2 md:px-4 md:py-2.5 flex items-center gap-2 md:gap-3 fade-in pointer-events-none">
-        <div className="w-7 h-7 md:w-8 md:h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-bold text-xs md:text-sm shadow-lg">
-          M
+        <div className="rounded-lg shadow-lg palter-logo flex items-center justify-center p-0.5">
+          <PalterLogo size={28} />
         </div>
         <div>
-          <div className="font-semibold tracking-tight text-xs md:text-sm">My Maps</div>
+          <div className="font-semibold tracking-tight text-xs md:text-sm">Palter Map</div>
           <div className="text-[9px] md:text-[10px] text-white/40 -mt-0.5">
-            MapLibre · MapTiler
+            Explore the world, faster
           </div>
         </div>
       </div>
 
-      {/* =============================== */}
-      {/* MAP STYLE + SATELLITE CONTROLS  */}
-      {/* Desktop: top-right              */}
-      {/* Mobile: compact row below brand */}
-      {/* =============================== */}
       <div className="hidden md:flex absolute top-4 right-16 z-10 gap-2 justify-end">
         <div className="glass rounded-xl p-1 flex gap-0.5">
           {Object.keys(STYLES).map((name) => (
@@ -1171,7 +1605,6 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Mobile bottom bar — the horizontal line to slide panel */}
       <div className="md:hidden absolute bottom-0 left-0 right-0 z-20">
         <button
           onClick={() => setPanelOpen((v) => !v)}
@@ -1185,19 +1618,7 @@ export default function Home() {
         </button>
       </div>
 
-      {/* =============================== */}
-      {/* LEFT PANEL (POI + FAVORITES)    */}
-      {/* Desktop: always visible          */}
-      {/* Mobile: slide-in from bottom     */}
-      {/* =============================== */}
-      <div
-        className={`
-          absolute z-10 w-[280px] flex flex-col gap-3
-          left-4 top-20 max-h-[calc(100vh-7rem)] overflow-y-auto fancy-scroll pr-1
-          hidden md:flex
-        `}
-      >
-        {/* POI PANEL */}
+      <div className="absolute z-10 w-[280px] flex-col gap-3 left-4 top-20 max-h-[calc(100vh-7rem)] overflow-y-auto fancy-scroll pr-1 hidden md:flex">
         <div className="glass rounded-2xl p-3 fade-in">
           <div className="flex items-center justify-between mb-2">
             <div className="text-[11px] uppercase tracking-wider text-white/40 font-semibold">
@@ -1234,7 +1655,6 @@ export default function Home() {
           )}
         </div>
 
-        {/* FAVORITES PANEL */}
         <div className="glass rounded-2xl p-3 fade-in">
           <div className="flex items-center justify-between mb-2">
             <div className="text-[11px] uppercase tracking-wider text-white/40 font-semibold">
@@ -1272,9 +1692,6 @@ export default function Home() {
         </div>
       </div>
 
-      {/* =============================== */}
-      {/* MOBILE SLIDE-UP PANEL           */}
-      {/* =============================== */}
       <div
         className={`
           md:hidden fixed left-0 right-0 bottom-0 z-20
@@ -1283,13 +1700,7 @@ export default function Home() {
         `}
         style={{ paddingBottom: "3.25rem" }}
       >
-        <div
-          className="
-            glass rounded-t-3xl px-4 pt-5 pb-6
-            max-h-[70vh] overflow-y-auto fancy-scroll
-          "
-        >
-          {/* Mobile style + satellite row */}
+        <div className="glass rounded-t-3xl px-4 pt-5 pb-6 max-h-[70vh] overflow-y-auto fancy-scroll">
           <div className="flex flex-col gap-2 mb-4">
             <div className="text-[10px] uppercase tracking-wider text-white/40 font-semibold">
               Map style
@@ -1344,7 +1755,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Nearby POIs */}
           <div className="flex items-center justify-between mb-2">
             <div className="text-[11px] uppercase tracking-wider text-white/40 font-semibold">
               Nearby places
@@ -1373,13 +1783,7 @@ export default function Home() {
               </button>
             ))}
           </div>
-          {poiCount !== null && (
-            <div className="mb-4 -mt-2 text-[10px] text-white/50 text-center">
-              {poiCount === 0 ? "No results" : `${poiCount} result${poiCount === 1 ? "" : "s"} in view`}
-            </div>
-          )}
 
-          {/* Favorites */}
           <div className="flex items-center justify-between mb-2">
             <div className="text-[11px] uppercase tracking-wider text-white/40 font-semibold">
               ⭐ Favorites
@@ -1419,9 +1823,194 @@ export default function Home() {
         </div>
       </div>
 
-      {/* =============================== */}
-      {/* DIRECTIONS PANEL                 */}
-      {/* =============================== */}
+      {/* Weather switcher */}
+      <div className="absolute top-20 right-4 z-20 flex flex-col gap-1.5">
+        <button
+          onClick={() => {
+            const next = !weatherOpen;
+            setWeatherOpen(next);
+            if (!next) setActiveWeatherLayer(null);
+          }}
+          title="Weather mode"
+          className={`w-11 h-11 rounded-xl flex items-center justify-center shadow-lg transition-all backdrop-blur-md border border-white/10 ${
+            weatherOpen
+              ? "bg-orange-500 text-white"
+              : "bg-[rgba(20,20,25,0.85)] text-white/80 hover:bg-[rgba(40,40,50,0.9)]"
+          }`}
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M17.5 19a4.5 4.5 0 100-9 6 6 0 10-11.7 2A4 4 0 007 19h10.5z" />
+          </svg>
+        </button>
+
+        {weatherOpen && (
+          <>
+            <button
+              onClick={() => setActiveWeatherLayer((v) => (v === "rain" ? null : "rain"))}
+              title="Rain radar (animated)"
+              className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center shadow-lg transition-all backdrop-blur-md border border-white/10 ${
+                activeWeatherLayer === "rain"
+                  ? "bg-sky-500 text-white"
+                  : "bg-[rgba(20,20,25,0.85)] text-white/70 hover:bg-[rgba(40,40,50,0.9)]"
+              }`}
+            >
+              <span className="text-base leading-none">🌧️</span>
+            </button>
+            {WEATHER_LAYERS.map((w) => (
+              <button
+                key={w.id}
+                onClick={() =>
+                  setActiveWeatherLayer((v) => (v === w.id ? null : w.id))
+                }
+                title={w.label}
+                className={`w-11 h-11 rounded-xl flex flex-col items-center justify-center shadow-lg transition-all backdrop-blur-md border border-white/10 ${
+                  activeWeatherLayer === w.id
+                    ? "bg-sky-500 text-white"
+                    : "bg-[rgba(20,20,25,0.85)] text-white/70 hover:bg-[rgba(40,40,50,0.9)]"
+                }`}
+              >
+                <span className="text-base leading-none">{w.icon}</span>
+              </button>
+            ))}
+          </>
+        )}
+      </div>
+
+      {/* Rain animation controls */}
+      {weatherOpen && activeWeatherLayer === "rain" && rainFrames.length > 0 && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20 glass rounded-2xl px-4 py-3 w-[min(440px,92vw)] fade-in">
+          <div className="flex items-center gap-3 mb-2">
+            <button
+              onClick={() => setRainPlaying((v) => !v)}
+              className="w-8 h-8 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-white"
+            >
+              {rainPlaying ? "⏸" : "▶"}
+            </button>
+            <div className="text-[11px] font-semibold text-white flex-1">
+              Rain radar
+            </div>
+            <div className="text-[10px] text-white/60 tabular-nums">
+              {new Date(rainFrames[rainFrameIdx]?.time ?? Date.now()).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              })}
+            </div>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={rainFrames.length - 1}
+            value={rainFrameIdx}
+            onChange={(e) => {
+              setRainPlaying(false);
+              setRainFrameIdx(parseInt(e.target.value));
+            }}
+            className="w-full accent-sky-400"
+          />
+          <div className="flex justify-between text-[9px] text-white/40 mt-1">
+            <span>-2h</span>
+            <span>Now</span>
+            <span>+30m</span>
+          </div>
+        </div>
+      )}
+
+      {/* Weather legend + opacity */}
+      {weatherOpen && activeLayerDef && (
+        <div className="absolute bottom-6 left-4 z-20 glass rounded-2xl p-3 w-[220px] fade-in">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-base">{activeLayerDef.icon}</span>
+            <div className="text-xs font-semibold">{activeLayerDef.label}</div>
+            <div className="text-[10px] text-white/40 ml-auto">
+              {activeLayerDef.legend.unit}
+            </div>
+          </div>
+          <div className="flex h-2 rounded-full overflow-hidden mb-1.5">
+            {activeLayerDef.legend.stops.map((s, i) => (
+              <div key={i} style={{ backgroundColor: s.color, flex: 1 }} />
+            ))}
+          </div>
+          <div className="flex justify-between text-[9px] text-white/50">
+            {activeLayerDef.legend.stops.map((s, i) => (
+              <span key={i}>{s.label}</span>
+            ))}
+          </div>
+
+          {weatherFetching && (
+            <div className="mt-2 text-[10px] text-sky-400 flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-sky-400 pulse-dot" />
+              Loading layer…
+            </div>
+          )}
+
+          <div className="mt-3 pt-3 border-t border-white/10">
+            <div className="text-[10px] text-white/40 mb-1.5">Opacity</div>
+            <input
+              type="range"
+              min={10}
+              max={100}
+              value={Math.round(weatherOpacity * 100)}
+              onChange={(e) => setWeatherOpacity(parseInt(e.target.value) / 100)}
+              className="w-full accent-sky-400"
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Weather point popup */}
+      {weatherOpen && weatherPoint && (
+        <div className="absolute bottom-6 right-4 z-20 glass rounded-2xl p-3 w-[240px] fade-in">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-[11px] uppercase tracking-wider text-white/40 font-semibold">
+              Point forecast
+            </div>
+            {weatherLoading && (
+              <div className="text-[10px] text-orange-400">Loading…</div>
+            )}
+            <button
+              onClick={() => {
+                setWeatherPoint(null);
+                weatherPointMarkerRef.current?.remove();
+                weatherPointMarkerRef.current = null;
+              }}
+              className="w-5 h-5 rounded flex items-center justify-center text-white/40 hover:text-white hover:bg-white/5"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+            <div className="bg-white/5 rounded-lg p-2">
+              <div className="text-white/40 text-[9px] uppercase">Temp</div>
+              <div className="font-semibold">{weatherPoint.temperature.toFixed(1)}°C</div>
+            </div>
+            <div className="bg-white/5 rounded-lg p-2">
+              <div className="text-white/40 text-[9px] uppercase">Wind</div>
+              <div className="font-semibold">
+                {weatherPoint.windSpeed.toFixed(0)} km/h {windDirectionLabel(weatherPoint.windDirection)}
+              </div>
+            </div>
+            <div className="bg-white/5 rounded-lg p-2">
+              <div className="text-white/40 text-[9px] uppercase">Cloud</div>
+              <div className="font-semibold">{weatherPoint.cloudCover.toFixed(0)}%</div>
+            </div>
+            <div className="bg-white/5 rounded-lg p-2">
+              <div className="text-white/40 text-[9px] uppercase">Humidity</div>
+              <div className="font-semibold">{weatherPoint.humidity.toFixed(0)}%</div>
+            </div>
+            <div className="bg-white/5 rounded-lg p-2">
+              <div className="text-white/40 text-[9px] uppercase">Pressure</div>
+              <div className="font-semibold">{weatherPoint.pressure.toFixed(0)}</div>
+            </div>
+            <div className="bg-white/5 rounded-lg p-2">
+              <div className="text-white/40 text-[9px] uppercase">Weather</div>
+              <div className="font-semibold truncate">{weatherCodeLabel(weatherPoint.code)}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Directions */}
       {directionsOpen && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 mt-16 md:mt-20 w-[380px] max-w-[calc(100vw-2rem)] glass rounded-2xl p-4 fade-in">
           <div className="flex items-center justify-between mb-3">
@@ -1447,7 +2036,6 @@ export default function Home() {
             </div>
           </div>
 
-          {/* From input */}
           <div className="relative mb-2">
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-full bg-green-500 ring-4 ring-green-500/20 shrink-0" />
@@ -1489,7 +2077,6 @@ export default function Home() {
             )}
           </div>
 
-          {/* To input */}
           <div className="relative mb-3">
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-full bg-red-500 ring-4 ring-red-500/20 shrink-0" />
@@ -1546,20 +2133,12 @@ export default function Home() {
             <>
               <div className="grid grid-cols-2 gap-2 mb-3">
                 <div className="bg-white/5 rounded-xl px-3 py-2">
-                  <div className="text-[10px] uppercase tracking-wider text-white/40">
-                    Distance
-                  </div>
-                  <div className="text-base font-semibold">
-                    {formatDistance(routeInfo.distance)}
-                  </div>
+                  <div className="text-[10px] uppercase tracking-wider text-white/40">Distance</div>
+                  <div className="text-base font-semibold">{formatDistance(routeInfo.distance)}</div>
                 </div>
                 <div className="bg-white/5 rounded-xl px-3 py-2">
-                  <div className="text-[10px] uppercase tracking-wider text-white/40">
-                    Duration
-                  </div>
-                  <div className="text-base font-semibold">
-                    {formatDuration(routeInfo.duration)}
-                  </div>
+                  <div className="text-[10px] uppercase tracking-wider text-white/40">Duration</div>
+                  <div className="text-base font-semibold">{formatDuration(routeInfo.duration)}</div>
                 </div>
               </div>
 
@@ -1574,9 +2153,7 @@ export default function Home() {
                       <div className="text-xs text-white/90 truncate">
                         {s.name || s.maneuver.type}
                       </div>
-                      <div className="text-[11px] text-white/40">
-                        {formatDistance(s.distance)}
-                      </div>
+                      <div className="text-[11px] text-white/40">{formatDistance(s.distance)}</div>
                     </div>
                   </div>
                 ))}
@@ -1586,9 +2163,7 @@ export default function Home() {
         </div>
       )}
 
-      {/* =============================== */}
-      {/* MEASURE PANEL                    */}
-      {/* =============================== */}
+      {/* Measure */}
       {measureActive && (
         <div className="absolute top-4 left-1/2 -translate-x-1/2 mt-32 md:mt-20 z-30 glass rounded-2xl px-3 py-2 md:px-4 md:py-3 fade-in flex items-center gap-2 md:gap-3 max-w-[calc(100vw-2rem)] overflow-x-auto fancy-scroll">
           <div className="flex gap-0.5 rounded-lg p-0.5 bg-white/5 shrink-0">
@@ -1643,11 +2218,7 @@ export default function Home() {
         </div>
       )}
 
-      {/* =============================== */}
-      {/* RIGHT-SIDE FLOATING BUTTONS     */}
-      {/* Desktop: column at bottom-right */}
-      {/* Mobile: single row at top-right */}
-      {/* =============================== */}
+      {/* Desktop bottom-right buttons */}
       <div className="hidden md:flex absolute bottom-24 right-4 z-10 flex-col gap-2">
         <button
           onClick={() => setDirectionsOpen((v) => !v)}
@@ -1708,14 +2279,12 @@ export default function Home() {
         </button>
       </div>
 
-      {/* Mobile floating buttons — top-right column */}
+      {/* Mobile right-side buttons */}
       <div className="md:hidden absolute top-3 right-3 z-10 flex flex-col gap-2">
         <button
           onClick={() => setDirectionsOpen((v) => !v)}
           className={`w-10 h-10 rounded-xl flex items-center justify-center shadow-lg transition-all backdrop-blur-md border border-white/10 ${
-            directionsOpen
-              ? "bg-indigo-500 text-white"
-              : "bg-[rgba(20,20,25,0.85)] text-white/80"
+            directionsOpen ? "bg-indigo-500 text-white" : "bg-[rgba(20,20,25,0.85)] text-white/80"
           }`}
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1735,9 +2304,7 @@ export default function Home() {
         <button
           onClick={toggleMeasure}
           className={`w-10 h-10 rounded-xl flex items-center justify-center shadow-lg transition-all backdrop-blur-md border border-white/10 ${
-            measureActive
-              ? "bg-amber-500 text-white"
-              : "bg-[rgba(20,20,25,0.85)] text-white/80"
+            measureActive ? "bg-amber-500 text-white" : "bg-[rgba(20,20,25,0.85)] text-white/80"
           }`}
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1749,9 +2316,7 @@ export default function Home() {
         <button
           onClick={toggleTracking}
           className={`w-10 h-10 rounded-xl flex items-center justify-center shadow-lg transition-all backdrop-blur-md border border-white/10 ${
-            tracking
-              ? "bg-blue-500 text-white"
-              : "bg-[rgba(20,20,25,0.85)] text-white/80"
+            tracking ? "bg-blue-500 text-white" : "bg-[rgba(20,20,25,0.85)] text-white/80"
           }`}
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -1765,9 +2330,6 @@ export default function Home() {
         </button>
       </div>
 
-      {/* =============================== */}
-      {/* SAVE DIALOG                      */}
-      {/* =============================== */}
       {showSaveDialog && (
         <div
           className="absolute inset-0 z-40 flex items-center justify-center bg-black/40 backdrop-blur-sm fade-in"
@@ -1810,32 +2372,23 @@ export default function Home() {
         </div>
       )}
 
-      {/* =============================== */}
-      {/* BASEMAP LEGEND                   */}
-      {/* =============================== */}
-      {basemap === "satellite-s2" && !measureActive && (
+      {basemap === "satellite-s2" && !measureActive && !activeWeatherLayer && (
         <div className="hidden md:block absolute bottom-6 left-1/2 -translate-x-1/2 z-10 glass rounded-xl px-4 py-2 text-[11px] text-white/70 fade-in">
           🌍 MapTiler Satellite · up to 8cm/pixel · worldwide
         </div>
       )}
-      {basemap === "satellite-esri" && !measureActive && (
+      {basemap === "satellite-esri" && !measureActive && !activeWeatherLayer && (
         <div className="hidden md:block absolute bottom-6 left-1/2 -translate-x-1/2 z-10 glass rounded-xl px-4 py-2 text-[11px] text-white/70 fade-in">
           🛰️ Esri World Imagery · sharp detail · worldwide
         </div>
       )}
 
-      {/* =============================== */}
-      {/* TOAST                            */}
-      {/* =============================== */}
       {toast && (
         <div className="absolute bottom-32 md:bottom-24 left-1/2 -translate-x-1/2 z-40 glass rounded-xl px-4 py-2.5 text-sm text-white fade-in max-w-[calc(100vw-2rem)] text-center">
           {toast}
         </div>
       )}
 
-      {/* =============================== */}
-      {/* MAP CONTAINER                    */}
-      {/* =============================== */}
       <div ref={containerRef} className="w-full h-full" />
     </div>
   );
